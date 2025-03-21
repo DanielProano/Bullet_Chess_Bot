@@ -148,20 +148,22 @@ impl AlphaBeta {
             println!("start alpha spawned thread!");
             let board = Arc::clone(&board);
             let best_move = Arc::clone(&best_move);
-            let table = transposition_table::new(); // Corrected table initialization
+            let table = transposition_table::new();
+            let mut best_score = -i32::MAX;
             move || {
                 let mut depth = 1;
                 let mut alpha = -i32::MAX;
                 let mut beta = i32::MAX;
+                let mut board_locked = board.lock().unwrap();
 
                 loop {
                     if start.elapsed().as_millis() > time_limit as u128 {
+                        println!("time up in start alpha");
                         break;
                     }
 
-                    let mut board_locked = board.lock().unwrap();
+                    println!("start alpha board {}", board_locked);
 
-                    // Generate and categorize moves
                     let moves = AlphaBeta::categorize_moves(&board_locked, None, color);
 
                     // Parallel move evaluation using Rayon
@@ -178,42 +180,52 @@ impl AlphaBeta {
                             color,
                             &table, // Use the newly created table
                         );
+                        println!("start alpha {}", score);;
                         (score, *m) // Tuple of score and the move
                     })
                         .max_by_key(|(score, _)| *score); // Get the move with the max score
 
-                    // If a best move is found, update the best_move
-                    if let Some((_, best_m)) = best {
-                        *best_move.lock().unwrap() = Some(best_m);
+                    if let Some((score , best_m)) = best {
+                        println!("start alpha best move {}", best_m);
+                        board_locked.play_unchecked(best_m);
+                        if score > best_score {
+                            println!("start alpha score is higher than best");
+                            *best_move.lock().unwrap() = Some(best_m);
+                            best_score = score;
 
-                        // Update transposition table with the best move and its evaluation
-                        let eval = AlphaBeta::alpha_beta_search(
-                            &board_locked,
-                            depth,
-                            alpha,
-                            beta,
-                            color == Color::White,
-                            None,
-                            color,
-                            &table, // Use the newly created table
-                        );
+                            // Update transposition table with the best move and its evaluation
+                            let eval = AlphaBeta::alpha_beta_search(
+                                &board_locked,
+                                depth,
+                                alpha,
+                                beta,
+                                color == Color::White,
+                                None,
+                                color,
+                                &table, // Use the newly created table
+                            );
+                            println!("start alpha eval {}", eval);;
 
-                        let entry = Entry {
-                            score: eval,
-                            depth: depth as i32,
-                            flag: flag_type::Exact,
-                            best_move: best_m.to_string(), // Move as string representation
-                        };
+                            let entry = Entry {
+                                score: eval,
+                                depth: depth as i32,
+                                flag: flag_type::Exact,
+                                best_move: best_m.to_string(), // Move as string representation
+                            };
 
-                        let hash = ZOBRIST.hash_position(&board_locked);
-                        table.store(hash, entry); // Store in TT
+                            let hash = ZOBRIST.hash_position(&board_locked);
+                            println!("start alpha hash {}", hash);;
+                            table.store(hash, entry); // Store in TT
+                        }
                     }
 
                     // Increment depth for iterative deepening
                     depth += 1;
+                    println!("start alpha depth{}", depth);;
 
                     // Stop if the game is over
                     if !game_on {
+                        println!("start alpha game over{}", game_on);;
                         break;
                     }
                 }
@@ -221,8 +233,10 @@ impl AlphaBeta {
         });
 
         while start.elapsed().as_millis() < time_limit as u128 && game_on {
+            println!("start alpha start while loop happened");
             // Check for the best move found so far
             if let Some(best) = best_move.lock().unwrap().clone() {
+                println!("best in while loop in start alpha {}", best);;
                 return best; // Return as soon as we find a best move
             }
 
@@ -230,12 +244,13 @@ impl AlphaBeta {
             std::thread::sleep(std::time::Duration::from_millis(10)); // Poll every 100ms
         }
 
-        // Return the fallback move if no best move is found within the time limit
-        best_move.lock().unwrap().unwrap_or(fallback)
+        let best = best_move.lock().unwrap().unwrap_or(fallback);
+        println!("start alpha end best move{}", best);
+        best
     }
 
     fn categorize_moves(board: &Board, previous_best: Option<Move>, color: Color) -> Vec<Move> {
-        let mut total = Vec::new();;
+        let mut total = Vec::new();
         board.generate_moves(|moves| {
             for move_ in moves {
                 if let Some(piece) = board.piece_on(move_.from) {
@@ -282,6 +297,10 @@ impl AlphaBeta {
         sorted_moves.extend(checks);
         sorted_moves.extend(captures);
         sorted_moves.extend(normal);
+        // println!("Total moves:");
+        // for move_ in &sorted_moves {
+        //     println!("{}", move_);
+        // }
 
         sorted_moves
     }
