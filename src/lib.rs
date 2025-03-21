@@ -8,12 +8,13 @@ use rand::Rng;
 use std::thread;
 use std::time::{Duration, Instant};
 use lazy_static::lazy_static;
-use std::sync::atomic::{AtomicI32, Ordering};
+use std::sync::atomic::{AtomicI32, AtomicBool, Ordering};
 use chess::Color::White;
 use pyo3::types::PyString;
 use std::str::FromStr;
 use pyo3::exceptions::socket::timeout;
 use pyo3::indoc::eprintdoc;
+
 
 lazy_static! {
     static ref ZOBRIST: Zobrist = Zobrist::new();
@@ -154,78 +155,35 @@ impl AlphaBeta {
                 let mut depth = 1;
                 let mut alpha = -i32::MAX;
                 let mut beta = i32::MAX;
-                let mut board_locked = board.lock().unwrap();
 
-                loop {
-                    if start.elapsed().as_millis() > time_limit as u128 {
-                        println!("time up in start alpha");
-                        break;
+                while start.elapsed().as_millis() < time_limit as u128 {
+                    // Get a fresh snapshot of the board state each iteration
+                    let current_board = {
+                        let board_locked = board.lock().unwrap();
+                        board_locked.clone()
+                    };
+
+                    let candidate_move = AlphaBeta::iterative_deepening(
+                        &current_board,
+                        depth,
+                        start,
+                        time_limit,
+                        color,
+                        &table,
+                    );
+                    println!("Depth {} candidate: {}", depth, candidate_move);
+
+                    {
+                        // Update the shared board state with the candidate move.
+                        let mut board_locked = board.lock().unwrap();
+                        board_locked.play_unchecked(candidate_move);
                     }
+                    // Update the shared best move
+                    *best_move.lock().unwrap() = Some(candidate_move);
 
-                    println!("start alpha board {}", board_locked);
-
-                    let moves = AlphaBeta::categorize_moves(&board_locked, None, color);
-
-                    // Parallel move evaluation using Rayon
-                    let best = moves.par_iter().map(|m| {
-                        let mut new_board = board_locked.clone();
-                        new_board.play_unchecked(*m);
-                        let score = AlphaBeta::alpha_beta_search(
-                            &new_board,
-                            depth,
-                            alpha,
-                            beta,
-                            color == Color::White,
-                            None,
-                            color,
-                            &table, // Use the newly created table
-                        );
-                        println!("start alpha {}", score);;
-                        (score, *m) // Tuple of score and the move
-                    })
-                        .max_by_key(|(score, _)| *score); // Get the move with the max score
-
-                    if let Some((score , best_m)) = best {
-                        println!("start alpha best move {}", best_m);
-                        board_locked.play_unchecked(best_m);
-                        if score > best_score {
-                            println!("start alpha score is higher than best");
-                            *best_move.lock().unwrap() = Some(best_m);
-                            best_score = score;
-
-                            // Update transposition table with the best move and its evaluation
-                            let eval = AlphaBeta::alpha_beta_search(
-                                &board_locked,
-                                depth,
-                                alpha,
-                                beta,
-                                color == Color::White,
-                                None,
-                                color,
-                                &table, // Use the newly created table
-                            );
-                            println!("start alpha eval {}", eval);;
-
-                            let entry = Entry {
-                                score: eval,
-                                depth: depth as i32,
-                                flag: flag_type::Exact,
-                                best_move: best_m.to_string(), // Move as string representation
-                            };
-
-                            let hash = ZOBRIST.hash_position(&board_locked);
-                            println!("start alpha hash {}", hash);;
-                            table.store(hash, entry); // Store in TT
-                        }
-                    }
-
-                    // Increment depth for iterative deepening
-                    depth += 1;
-                    println!("start alpha depth{}", depth);;
-
-                    // Stop if the game is over
+                    depth += 1; // Increase depth for the next iteration
                     if !game_on {
-                        println!("start alpha game over{}", game_on);;
+                        println!("Game over detected. Exiting search loop.");
                         break;
                     }
                 }
@@ -234,23 +192,22 @@ impl AlphaBeta {
 
         while start.elapsed().as_millis() < time_limit as u128 && game_on {
             println!("start alpha start while loop happened");
-            // Check for the best move found so far
             if let Some(best) = best_move.lock().unwrap().clone() {
                 println!("best in while loop in start alpha {}", best);;
-                return best; // Return as soon as we find a best move
+                return best;
             }
 
-            // Optionally, you can add a small delay to prevent a busy-wait loop
-            std::thread::sleep(std::time::Duration::from_millis(10)); // Poll every 100ms
+            std::thread::sleep(std::time::Duration::from_millis(5));
         }
 
         let best = best_move.lock().unwrap().unwrap_or(fallback);
-        println!("start alpha end best move{}", best);
+        println!("end best move{}", best);
         best
     }
 
     fn categorize_moves(board: &Board, previous_best: Option<Move>, color: Color) -> Vec<Move> {
         let mut total = Vec::new();
+        println!("categorize color {}", color);
         board.generate_moves(|moves| {
             for move_ in moves {
                 if let Some(piece) = board.piece_on(move_.from) {
@@ -279,7 +236,7 @@ impl AlphaBeta {
         for m in total {
             let mut new_board = board.clone();
             new_board.play_unchecked(m);
-            let captured = board.piece_on(m.to);
+            let captured = new_board.piece_on(m.to);
 
             if Some(m) == best_move {
                 sorted_moves.push(m);
@@ -306,16 +263,32 @@ impl AlphaBeta {
     }
 
     fn iterative_deepening(board: &Board, depth: i32, start: Instant, limit: i32, color: Color, tt: &transposition_table) -> Move {
+        let fallback = Move {
+            from: cozy_chess::Square::A1,
+            to: cozy_chess::Square::A1,
+            promotion: None,
+        };
+        let current_color = if depth > 1 {
+            if color == Color::White { Color::Black } else { Color::White }
+        } else {
+            color
+        };
+        println!("iterative deepening color: {}", current_color);
+
         let mut best_move = Arc::new(Mutex::new(None));
         let previous_best = best_move.lock().unwrap().clone();
-        let moves = Self::categorize_moves(&board, previous_best, color);
+        let moves = Self::categorize_moves(&board, previous_best, current_color);
         let mut max_eval = Arc::new(AtomicI32::new(-i32::MAX));
 
+        if moves.is_empty() {
+            return fallback;
+        }
         moves.par_iter().for_each(|m| {
             let mut new_board = board.clone();
             if new_board.is_legal(*m) {
                 new_board.play_unchecked(*m);
-                let eval = Self::alpha_beta_search(&new_board, depth - 1, -i32::MAX, i32::MAX, false, previous_best, color, tt);
+
+                let eval = Self::alpha_beta_search(&new_board, depth - 1, -i32::MAX, i32::MAX, false, previous_best, current_color, tt);
 
                 let mut best_move_lock = best_move.lock().unwrap();
                 let current_max = max_eval.load(Ordering::Relaxed);
@@ -333,21 +306,24 @@ impl AlphaBeta {
         best_move.lock().unwrap().unwrap_or(moves[0])
     }
 
-    fn alpha_beta_search(board: &Board, depth: i32, mut alpha: i32, mut beta: i32, max_player: bool, previous_best: Option<Move>, color: Color, tt: &transposition_table) -> i32 {
-        // Generate the hash for the current board state.
-        let hash = board.hash(); // Assuming `hash()` is a method that computes a unique hash for the board state.
+    fn alpha_beta_search(board: &Board, depth: i32, mut alpha: i32, mut beta: i32, max_player: bool, previous_best: Option<Move>, color_in: Color, tt: &transposition_table) -> i32 {
+        //println!("SEARCHING...");
+        let hash = board.hash();
+        let color = if depth >= 1 {
+            if color_in == Color::White { Color::Black } else { Color::White }
+        } else {
+            color_in
+        };
 
-        // First, check the transposition table.
         if let Some(entry) = tt.get(hash) {
-            // If the stored depth is greater than or equal to the current depth, return the stored score.
             if entry.depth >= depth {
                 match entry.flag {
-                    flag_type::Exact => return entry.score,   // Exact value, return it
-                    flag_type::Lower => if entry.score > alpha { alpha = entry.score },  // Lower bound, adjust alpha
-                    flag_type::Upper => if entry.score < beta { beta = entry.score },    // Upper bound, adjust beta
+                    flag_type::Exact => return entry.score,
+                    flag_type::Lower => if entry.score > alpha { alpha = entry.score },
+                    flag_type::Upper => if entry.score < beta { beta = entry.score },
                 }
                 if beta <= alpha {
-                    return entry.score; // Cutoff if bounds are violated
+                    return entry.score;
                 }
             }
         }
@@ -362,12 +338,13 @@ impl AlphaBeta {
                     }
                 }
                 Err(e) => {
-                    eprintln!("Error from calculated material {}", e);
+                    eprintln!("Error in SEARCH {}", e);
                     return 0;
                 }
             }
         }
 
+        //println!("Alpha Search Color {}", color);
         let moves = Self::categorize_moves(&board, previous_best, color);
 
         if max_player {
@@ -385,12 +362,11 @@ impl AlphaBeta {
                 }
             }
 
-            // Store the result in the TT.
             tt.store(hash, Entry {
                 score: max_eval,
                 depth: depth as i32,
                 flag: flag_type::Exact,
-                best_move: "BestMove".to_string(),  // Assuming you set the best move here
+                best_move: "BestMove".to_string(),
             });
 
             max_eval
@@ -409,12 +385,11 @@ impl AlphaBeta {
                 }
             }
 
-            // Store the result in the TT.
             tt.store(hash, Entry {
                 score: min_eval,
                 depth: depth as i32,
                 flag: flag_type::Exact,
-                best_move: "BestMove".to_string(),  // Set the best move here too
+                best_move: "BestMove".to_string(),
             });
 
             min_eval
@@ -491,12 +466,12 @@ impl Zobrist {
                         Piece::Rook => 3,
                         Piece::Queen => 4,
                         Piece::King => 5,
-                        _ => continue, // If it's an invalid piece, skip it
+                        _ => continue,
                     };
 
                     if piece_index >= PIECE_TYPES || square_index >= BOARD_SQUARES {
-                        eprintln!("Warning: piece_index or square_index out of bounds");
-                        continue; // Skip this iteration
+                        eprintln!("Piece_index or square_index out of bounds");
+                        continue;
                     }
 
                     hash ^= self.piece_keys[piece_index][square_index];
@@ -715,8 +690,8 @@ fn calculate_material(board: &Board) -> Result<(i32, i32), String> {
             black_pts += black_count * value;
         }
     }
-    println!("white eval: {}", white_pts);
-    println!("black eval: {}", black_pts);
+    //println!("white eval: {}", white_pts);
+    //println!("black eval: {}", black_pts);
     Ok((white_pts, black_pts))
 }
 
