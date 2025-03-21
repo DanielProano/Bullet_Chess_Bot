@@ -81,34 +81,26 @@ pub struct AlphaBeta;
 
 #[pyfunction]
 fn find_best_move(fen: String, my_time: i32, game_on: bool, color_in: Color2) -> PyResult<String> {
-    println!("Made it to find best move");
     let color = match color_in {
         Color2::White => Color::White,
         Color2::Black => Color::Black,
     };
-    println!("color: {}", color);
     let mut board = match Board::from_fen(&fen, false) {
         Ok(b) => Arc::new(Mutex::new(b)),
         Err(_) => return Err(pyo3::exceptions::PyValueError::new_err("Rust: bad FEN string")),
     };
-    println!("Made it to hash");
     let hash = ZOBRIST.hash_position(&board.lock().unwrap());
-    println!("hash: {}", hash);
-    println!("Made it past hash");
     if let Some(entry) = TABLE.get(hash) {
-        println!("hash: {}", entry.best_move);
+        println!("In table best move: {}", entry.best_move);
         return Ok(entry.best_move.to_string());
     }
 
     if !game_on {
         return Ok("END".to_string());
     }
-    println!("Made it to calc material");
     let eval = calculate_material(&board.lock().unwrap());
-    println!("Made it to time");
     let time_limit = determine_time(eval, my_time, game_on, color);
     println!("time limit {}", time_limit);
-    println!("Made it to alphas");
     let best_move = AlphaBeta::start_alpha_beta_search(Arc::clone(&board), time_limit, game_on, color);
     println!("Made it past alphas");
 
@@ -207,17 +199,9 @@ impl AlphaBeta {
 
     fn categorize_moves(board: &Board, previous_best: Option<Move>, color: Color) -> Vec<Move> {
         let mut total = Vec::new();
-        println!("categorize color {}", color);
+        //println!("categorize color {}", color);
         board.generate_moves(|moves| {
-            for move_ in moves {
-                if let Some(piece) = board.piece_on(move_.from) {
-                    if let Some(piece_color) = board.color_on(move_.from) {
-                        if piece_color == color {
-                            total.push(move_);
-                        }
-                    }
-                }
-            }
+            total.extend(moves);
             false
         });
         let mut best_move = previous_best;
@@ -268,52 +252,51 @@ impl AlphaBeta {
             to: cozy_chess::Square::A1,
             promotion: None,
         };
-        let current_color = if depth > 1 {
-            if color == Color::White { Color::Black } else { Color::White }
-        } else {
-            color
-        };
-        println!("iterative deepening color: {}", current_color);
+        // let current_color = if depth > 1 {
+        //     if color == Color::White { Color::Black } else { Color::White }
+        // } else {
+        //     color
+        // };
+        //println!("iterative deepening color: {}", color);
 
         let mut best_move = Arc::new(Mutex::new(None));
         let previous_best = best_move.lock().unwrap().clone();
-        let moves = Self::categorize_moves(&board, previous_best, current_color);
+        let moves = Self::categorize_moves(&board, previous_best, color);
         let mut max_eval = Arc::new(AtomicI32::new(-i32::MAX));
+        let mut root_move = Arc::new(Mutex::new(None));
 
         if moves.is_empty() {
             return fallback;
         }
+        let root_clone = Arc::clone(&root_move);
         moves.par_iter().for_each(|m| {
             let mut new_board = board.clone();
             if new_board.is_legal(*m) {
                 new_board.play_unchecked(*m);
 
-                let eval = Self::alpha_beta_search(&new_board, depth - 1, -i32::MAX, i32::MAX, false, previous_best, current_color, tt);
+                let eval = Self::alpha_beta_search(&new_board, depth - 1, -i32::MAX, i32::MAX, false, previous_best, color, tt);
 
                 let mut best_move_lock = best_move.lock().unwrap();
                 let current_max = max_eval.load(Ordering::Relaxed);
                 if eval > current_max {
                     max_eval.store(eval, Ordering::Relaxed);
                     *best_move_lock = Some(*m);
+                    let mut root_move_lock = root_clone.lock().unwrap();
+                    *root_move_lock = Some(*m);
                 }
             }
         });
 
         if start.elapsed().as_millis() < limit as u128 {
-            return best_move.lock().unwrap().unwrap_or(moves[0]);
+            return root_move.lock().unwrap().unwrap_or(moves[0]);
         }
 
-        best_move.lock().unwrap().unwrap_or(moves[0])
+        root_move.lock().unwrap().unwrap_or(moves[0])
     }
 
-    fn alpha_beta_search(board: &Board, depth: i32, mut alpha: i32, mut beta: i32, max_player: bool, previous_best: Option<Move>, color_in: Color, tt: &transposition_table) -> i32 {
+    fn alpha_beta_search(board: &Board, depth: i32, mut alpha: i32, mut beta: i32, max_player: bool, previous_best: Option<Move>, color: Color, tt: &transposition_table) -> i32 {
         //println!("SEARCHING...");
         let hash = board.hash();
-        let color = if depth >= 1 {
-            if color_in == Color::White { Color::Black } else { Color::White }
-        } else {
-            color_in
-        };
 
         if let Some(entry) = tt.get(hash) {
             if entry.depth >= depth {
@@ -353,7 +336,8 @@ impl AlphaBeta {
                 let mut new_board = board.clone();
                 if new_board.is_legal(m) {
                     new_board.play_unchecked(m);
-                    let eval = Self::alpha_beta_search(&new_board, depth - 1, alpha, beta, false, previous_best, color, tt);
+                    let opponent_color = if color == Color::White { Color::Black } else { Color::White };
+                    let eval = Self::alpha_beta_search(&new_board, depth - 1, alpha, beta, false, previous_best, opponent_color, tt);
                     max_eval = max_eval.max(eval);
                     alpha = alpha.max(eval);
                     if beta <= alpha {
@@ -376,7 +360,8 @@ impl AlphaBeta {
                 let mut new_board = board.clone();
                 if new_board.is_legal(m) {
                     new_board.play_unchecked(m);
-                    let eval = Self::alpha_beta_search(&new_board, depth - 1, alpha, beta, true, previous_best, color, tt);
+                    let opponent_color = if color == Color::White { Color::Black } else { Color::White };
+                    let eval = Self::alpha_beta_search(&new_board, depth - 1, alpha, beta, true, previous_best, opponent_color, tt);
                     min_eval = min_eval.min(eval);
                     beta = beta.min(eval);
                     if beta <= alpha {
